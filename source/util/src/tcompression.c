@@ -1023,17 +1023,11 @@ FORCE_INLINE uint64_t decodeDoubleValue(const char *const input, int32_t *const 
   return diff;
 }
 
-int32_t tsDecompressDoubleImp(const char *const input, const int32_t nelements, char *const output) {
+static int32_t tsDecompressDoubleImpHelper(const char *const input, const int32_t nelements, char *const output) {
   // output stream
-  double *ostream = (double *)output;
-
-  if (input[0] == 1) {
-    memcpy(output, input + 1, nelements * DOUBLE_BYTES);
-    return nelements * DOUBLE_BYTES;
-  }
-
+  double  *ostream = (double *)output;
   uint8_t  flags = 0;
-  int32_t  ipos = 1;
+  int32_t  ipos = 0;
   int32_t  opos = 0;
   uint64_t diff = 0;
   union {
@@ -1056,6 +1050,95 @@ int32_t tsDecompressDoubleImp(const char *const input, const int32_t nelements, 
   }
 
   return nelements * DOUBLE_BYTES;
+}
+
+#ifdef __AVX2__
+FORCE_INLINE __m256i decodeDoubleAvx2(const char *data, const char *flag, uint64_t cur) {
+  __m256i dataVec = _mm256_loadu_si256((__m256i *)data);
+  __m256i flagVec = _mm256_loadu_si256((__m256i *)flag);
+  __m256i k7 = _mm256_set1_epi64x(7);
+  __m256i lopart = _mm256_set_epi64x(0, -1, 0, -1);
+  __m256i hipart = _mm256_set_epi64x(-1, 0, -1, 0);
+  __m256i trTail = _mm256_cmpgt_epi64(flagVec, k7);
+  __m256i trHead = _mm256_andnot_si256(trTail, _mm256_set1_epi64x(-1));
+  __m256i shiftVec = _mm256_slli_epi64(_mm256_sub_epi64(k7, _mm256_and_si256(flagVec, k7)), 3);
+  __m256i maskVec = hipart;
+  __m256i diffVec = _mm256_sllv_epi64(dataVec, _mm256_and_si256(shiftVec, maskVec));
+  maskVec = _mm256_or_si256(trHead, lopart);
+  diffVec = _mm256_srlv_epi64(diffVec, _mm256_and_si256(shiftVec, maskVec));
+  maskVec = _mm256_and_si256(trTail, lopart);
+  diffVec = _mm256_sllv_epi64(diffVec, _mm256_and_si256(shiftVec, maskVec));
+  __m256i tmpVec = _mm256_permute4x64_epi64(diffVec, 0b10010011);
+  tmpVec = _mm256_and_si256(tmpVec, _mm256_set_epi64x(-1, -1, -1, 0));
+  tmpVec = _mm256_xor_si256(tmpVec, diffVec);
+  __m256i resVec = _mm256_permute2x128_si256(tmpVec, tmpVec, 0x08);
+  resVec = _mm256_xor_si256(resVec, tmpVec);
+  resVec = _mm256_xor_si256(resVec, _mm256_set1_epi64x(cur));
+  return resVec;
+}
+
+#define M256_BYTES sizeof(__m256i)
+
+static int32_t tsDecompressDoubleImpAvx2(const char *const input, const int32_t nelements, char *const output) {
+  // Allocate memory-aligned buffer
+  char buf[M256_BYTES * 3];
+  memset(buf, 0, sizeof(buf));
+  char       *data = (char *)ALIGN_NUM((uint64_t)buf, M256_BYTES);
+  char       *flag = data + M256_BYTES;
+  const char *in = input;
+  char       *out = output;
+
+  // Load data into the buffer for batch processing
+  int32_t  batchSize = M256_BYTES / DOUBLE_BYTES;
+  uint64_t cur = 0;
+  int32_t  idx = 0;
+  for (int32_t i = 0; i < nelements; i += 2) {
+    if (idx == batchSize) {
+      // Start processing when the buffer is full
+      __m256i resVec = decodeDoubleAvx2(data, flag, cur);
+      _mm256_storeu_si256((__m256i *)out, resVec);
+      out += M256_BYTES;
+      cur = _mm256_extract_epi64(resVec, 3);
+      idx = 0;
+    }
+    uint8_t flag1 = (*in) & 0xF;
+    uint8_t flag2 = ((*in) >> 4) & 0xF;
+    int32_t nbytes1 = (flag1 & 0x7) + 1;
+    int32_t nbytes2 = (flag2 & 0x7) + 1;
+    in++;
+    flag[idx * DOUBLE_BYTES] = flag1;
+    flag[(idx + 1) * DOUBLE_BYTES] = flag2;
+    memcpy(data + idx * DOUBLE_BYTES + 8 - nbytes1, in, nbytes1 + nbytes2);
+    in += nbytes1 + nbytes2;
+    idx += 2;
+  }
+  if (idx) {
+    idx -= (nelements & 0x1);
+    // Process the remaining few bytes
+    __m256i resVec = decodeDoubleAvx2(data, flag, cur);
+    memcpy(out, &resVec, idx * DOUBLE_BYTES);
+    out += idx * DOUBLE_BYTES;
+  }
+  return (int32_t)(out - output);
+}
+#endif
+
+int32_t tsDecompressDoubleImp(const char *const input, const int32_t nelements, char *const output) {
+  // return the result directly if there is no compression
+  if (input[0] == 1) {
+    memcpy(output, input + 1, nelements * DOUBLE_BYTES);
+    return nelements * DOUBLE_BYTES;
+  }
+
+#ifdef __AVX2__
+  // use AVX2 implementation when allowed
+  if (tsSIMDEnable && tsAVX2Supported) {
+    return tsDecompressDoubleImpAvx2(input + 1, nelements, output);
+  }
+#endif
+
+  // use implementation without SIMD instructions by default
+  return tsDecompressDoubleImpHelper(input + 1, nelements, output);
 }
 
 /* --------------------------------------------Float Compression ---------------------------------------------- */

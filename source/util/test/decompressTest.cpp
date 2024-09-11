@@ -1,12 +1,9 @@
 #include <gtest/gtest.h>
 #include <stdlib.h>
 #include <tcompression.h>
+#include <chrono>
 #include <random>
 #include "ttypes.h"
-
-namespace {
-
-}  // namespace
 
 TEST(utilTest, decompress_ts_test) {
   {
@@ -38,11 +35,13 @@ TEST(utilTest, decompress_ts_test) {
   }
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  tsList[0] = 1286; tsList[1] = 1124;  tsList[2]=2681; tsList[3] = 2823;
+  tsList[0] = 1286;
+  tsList[1] = 1124;
+  tsList[2] = 2681;
+  tsList[3] = 2823;
 
-//  char*   pOutput[4 * sizeof(int64_t)] = {0};
-  len = tsCompressTimestamp(tsList, sizeof(tsList), sizeof(tsList) / sizeof(tsList[0]), pOutput, 4,
-                                    ONE_STAGE_COMP, NULL, 0);
+  len = tsCompressTimestamp(tsList, sizeof(tsList), sizeof(tsList) / sizeof(tsList[0]), pOutput, 4, ONE_STAGE_COMP,
+                            NULL, 0);
 
   decompOutput[4 * 8] = {0};
   tsDecompressTimestamp(pOutput, len, 4, decompOutput, sizeof(int64_t) * 4, ONE_STAGE_COMP, NULL, 0);
@@ -89,7 +88,7 @@ TEST(utilTest, decompress_bigint_avx2_test) {
 
   char*   pOutput[10 * sizeof(int64_t)] = {0};
   int32_t len = tsCompressBigint(tsList, sizeof(tsList), sizeof(tsList) / sizeof(tsList[0]), pOutput, 10,
-                                    ONE_STAGE_COMP, NULL, 0);
+                                 ONE_STAGE_COMP, NULL, 0);
 
   char* decompOutput[10 * 8] = {0};
 
@@ -479,4 +478,106 @@ TEST(utilTest, compressAlg) {
     }
     taosMemoryFree(p);
   }
+}
+
+template <typename T>
+static std::vector<typename std::enable_if<std::is_integral<T>::value, T>::type> utilTestRandomData(
+    int32_t n, T min = std::numeric_limits<T>::min(), T max = std::numeric_limits<T>::max()) {
+  auto           seed = std::random_device()();
+  std::mt19937   gen(seed);
+  std::vector<T> data(n);
+  std::cout << "Seed of random data is " << seed << "\n";
+
+  std::uniform_int_distribution<T> dist(min, max);
+  for (auto& v : data) v = dist(gen);
+  return data;
+}
+
+template <typename T>
+static std::vector<typename std::enable_if<std::is_floating_point<T>::value, T>::type> utilTestRandomData(
+    int32_t n, T min = std::numeric_limits<T>::min(), T max = std::numeric_limits<T>::max()) {
+  auto           seed = std::random_device()();
+  std::mt19937   gen(seed);
+  std::vector<T> data(n);
+  std::cout << "Seed of random data is " << seed << "\n";
+
+  std::uniform_real_distribution<T> dist(min, max);
+  for (auto& v : data) v = dist(gen);
+  return data;
+}
+
+template <typename F>
+static double measureRunTime(const F& func, int32_t nround = 1) {
+  auto start = std::chrono::high_resolution_clock::now();
+  for (int32_t i = 0; i < nround; ++i) {
+    func();
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  return duration / 1000.0;
+}
+
+TEST(utilTest, decompressDoubleBasic) {
+  size_t            dataSize = utilTestRandomData(1, 1, 1024)[0];
+  auto              origData = utilTestRandomData<double>(dataSize);
+  std::vector<char> compData(origData.size() * sizeof(double) + 1);
+  lossyDouble = false;
+  int32_t cnt = tsCompressDouble(origData.data(), origData.size(), origData.size(), compData.data(), compData.size(),
+                                 ONE_STAGE_COMP, nullptr, 0);
+  ASSERT_LE(cnt, compData.size());
+  std::vector<double> decompData(origData.size());
+
+  // test simple implementation without SIMD instructions
+  tsSIMDEnable = 0;
+  cnt = tsDecompressDouble(compData.data(), compData.size(), decompData.size(), decompData.data(), decompData.size(),
+                           ONE_STAGE_COMP, nullptr, 0);
+  ASSERT_EQ(cnt, decompData.size() * sizeof(double));
+  EXPECT_EQ(origData, decompData);
+
+#ifdef __AVX2__
+  // test AVX2 implementation
+  tsSIMDEnable = 1;
+  tsAVX2Supported = 1;
+  cnt = tsDecompressDouble(compData.data(), compData.size(), decompData.size(), decompData.data(), decompData.size(),
+                           ONE_STAGE_COMP, nullptr, 0);
+  ASSERT_EQ(cnt, decompData.size() * sizeof(double));
+  EXPECT_EQ(origData, decompData);
+#endif
+}
+
+TEST(utilTest, decompressDoubleBenchmark) {
+  constexpr size_t  DATA_SIZE = 1 * 1024 * 1024;
+  constexpr int32_t NROUND = 1000;
+  auto              origData = utilTestRandomData<double>(DATA_SIZE, 0, 9999999999);
+  std::vector<char> compData(origData.size() * sizeof(double) + 1);
+  lossyDouble = false;
+  int32_t cnt = tsCompressDouble(origData.data(), origData.size(), origData.size(), compData.data(), compData.size(),
+                                 ONE_STAGE_COMP, nullptr, 0);
+  ASSERT_LE(cnt, compData.size());
+  std::cout << "Original size: " << origData.size() * sizeof(double) << "; Compressed size: " << compData.size()
+            << "; Compression ratio: " << 1.0 * origData.size() * sizeof(double) / compData.size() << "\n";
+  std::vector<double> decompData(origData.size());
+
+  tsSIMDEnable = 0;
+  auto ms = measureRunTime(
+      [&]() {
+        tsDecompressDouble(compData.data(), compData.size(), decompData.size(), decompData.data(), decompData.size(),
+                           ONE_STAGE_COMP, nullptr, 0);
+      },
+      NROUND);
+  std::cout << "Decompression of " << NROUND * DATA_SIZE << " double without SIMD costs " << ms
+            << " ms, avg speed: " << NROUND * DATA_SIZE * 1000 / ms << " data/s\n";
+
+#ifdef __AVX2__
+  tsSIMDEnable = 1;
+  tsAVX2Supported = 1;
+  ms = measureRunTime(
+      [&]() {
+        tsDecompressDouble(compData.data(), compData.size(), decompData.size(), decompData.data(), decompData.size(),
+                           ONE_STAGE_COMP, nullptr, 0);
+      },
+      NROUND);
+  std::cout << "Decompression of " << NROUND * DATA_SIZE << " double using AVX2 costs " << ms
+            << " ms, avg speed: " << NROUND * DATA_SIZE * 1000 / ms << " data/s\n";
+#endif
 }
