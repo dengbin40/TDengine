@@ -93,6 +93,87 @@ size_t getResultRowSize(SqlFunctionCtx* pCtx, int32_t numOfOutput) {
   return rowSize;
 }
 
+// Convert buf read from rocksdb to result row
+int32_t getResultRowFromBuf(SExprSupp *pSup, const char* inBuf, size_t inBufSize, char *outBuf, size_t *outBufSize) {
+  SqlFunctionCtx *pCtx = pSup->pCtx;
+  int32_t        *offset = pSup->rowEntryInfoOffset;
+  SResultRow     *pResultRow = (SResultRow*)outBuf;
+  size_t          processedSize = 0;
+  int32_t         code = TSDB_CODE_SUCCESS;
+  if (inBuf == NULL || outBuf == NULL) {
+    qError("invalid input buffer, inBuf:%p, outBuf:%p", inBuf, outBuf);
+    return TSDB_CODE_INVALID_PARA;
+  }
+  (void)memcpy(pResultRow, inBuf, sizeof(SResultRow));
+  inBuf += sizeof(SResultRow);
+  processedSize += sizeof(SResultRow);
+  for (int32_t i = 0; i < pSup->numOfExprs; ++i) {
+    int32_t len = *(int32_t*)inBuf;
+    inBuf += sizeof(int32_t);
+    processedSize += sizeof(int32_t);
+    if (pCtx->fpSet.decode) {
+      code = pCtx->fpSet.decode(&pCtx[i], inBuf, getResultEntryInfo(pResultRow, i, offset), pResultRow->version);
+      if (code != TSDB_CODE_SUCCESS) {
+        qError("failed to decode result row, code:%d", code);
+        return code;
+      }
+    } else {
+      (void)memcpy(getResultEntryInfo(pResultRow, i, offset), inBuf, len);
+    }
+    inBuf += len;
+    processedSize += len;
+  }
+  *outBufSize = getResultRowSize(pCtx, pSup->numOfExprs);
+  if (processedSize < inBufSize) {
+    // stream stores extra data after result row
+    size_t leftLen = inBufSize - processedSize;
+    (void)memcpy(outBuf + processedSize, inBuf, leftLen);
+    inBuf += leftLen;
+    processedSize += leftLen;
+    *outBufSize += leftLen;
+  }
+  return TSDB_CODE_SUCCESS;
+}
+
+// Convert result row to buf for rocksdb
+int32_t putResultRowToBuf(SExprSupp *pSup, const char* inBuf, size_t inBufSize, char *outBuf, size_t *outBufSize) {
+  SqlFunctionCtx *pCtx = pSup->pCtx;
+  int32_t        *offset = pSup->rowEntryInfoOffset;
+  SResultRow     *pResultRow = (SResultRow*)inBuf;
+  size_t          rowSize = getResultRowSize(pCtx, pSup->numOfExprs);
+
+  if (inBuf == NULL || outBuf == NULL) {
+    qError("invalid input buffer, inBuf:%p, outBuf:%p", inBuf, outBuf);
+    return TSDB_CODE_INVALID_PARA;
+  }
+  if (rowSize > inBufSize) {
+    qError("invalid input buffer size, rowSize:%zu, inBufSize:%zu", rowSize, inBufSize);
+    return TSDB_CODE_INVALID_PARA;
+  }
+  *outBufSize = 0;
+  pResultRow->version = FUNCTION_RESULT_INFO_VERSION;
+  (void)memcpy(outBuf, pResultRow, sizeof(SResultRow));
+  outBuf += sizeof(SResultRow);
+  *outBufSize += sizeof(SResultRow);
+  for (int32_t i = 0; i < pSup->numOfExprs; ++i) {
+    *(int32_t *) outBuf = offset[i];
+    outBuf += sizeof(int32_t);
+    *outBufSize += sizeof(int32_t);
+    size_t len = sizeof(SResultRowEntryInfo) + pCtx[i].resDataInfo.interBufSize;
+    (void)memcpy(outBuf, getResultEntryInfo(pResultRow, i, offset), len);
+    outBuf += len;
+    *outBufSize += len;
+  }
+  if (rowSize < inBufSize) {
+    // stream stores extra data after result row
+    size_t leftLen = inBufSize - rowSize;
+    (void)memcpy(outBuf, inBuf + rowSize, leftLen);
+    outBuf += leftLen;
+    *outBufSize += leftLen;
+  }
+  return TSDB_CODE_SUCCESS;
+}
+
 static void freeEx(void* p) { taosMemoryFree(*(void**)p); }
 
 void cleanupGroupResInfo(SGroupResInfo* pGroupResInfo) {
