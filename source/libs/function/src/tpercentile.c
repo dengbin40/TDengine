@@ -344,11 +344,14 @@ void tMemBucketDestroy(tMemBucket **pBucket) {
     SArray **p1 = p;
     p = taosHashIterate((*pBucket)->groupPagesMap, p);
     taosArrayDestroy(*p1);
+    *p1 = NULL;
   }
 
   destroyDiskbasedBuf((*pBucket)->pBuffer);
   taosMemoryFreeClear((*pBucket)->pSlots);
   taosHashCleanup((*pBucket)->groupPagesMap);
+  (*pBucket)->groupPagesMap = NULL;
+
   taosMemoryFreeClear(*pBucket);
 }
 
