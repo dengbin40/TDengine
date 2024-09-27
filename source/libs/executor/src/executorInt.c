@@ -688,7 +688,7 @@ int32_t copyResultrowToDataBlock(SExprInfo* pExprInfo, int32_t numOfExprs, SResu
       QUERY_CHECK_CODE(code, lino, _end);
 
       code = pCtx[j].fpSet.finalize(&pCtx[j], pBlock);
-      if (TAOS_FAILED(code)) {
+      if (code != TSDB_CODE_SUCCESS) {
         qError("%s build result data block error, code %s", GET_TASKID(pTaskInfo), tstrerror(code));
         QUERY_CHECK_CODE(code, lino, _end);
       }
